@@ -1,0 +1,6 @@
+{
+  "name": "omacachy",
+  "version": "0.1.0",
+  "description": "Install, maintain and troubleshoot Omarchy on CachyOS.",
+  "skills": "./skills/"
+}

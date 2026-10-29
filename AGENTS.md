@@ -13,3 +13,10 @@ The five canonical triage roles, each label string equal to its name (`needs-tri
 ### Domain docs
 
 The repo's map is `handoff.md` (components, version policy, release gates); the numbered engineering record is `plans/`, indexed by `plans/README.md`. Read `handoff.md` first. See `docs/agents/domain.md`.
+
+## Omacachy operations
+
+For installation, maintenance, configuration, updates, diagnosis and recovery,
+read `skills/omacachy/SKILL.md` and the relevant references. Shared workflows
+live in the repository; machine-specific context stays outside Git. See
+`docs/agents/assistant-package.md` for agent entry points and validation limits.

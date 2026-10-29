@@ -76,6 +76,10 @@ decide() {
 # profile migration scripts.
 # shellcheck source=bin/lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
+# shellcheck source=bin/lib/cachyos-preserve.sh
+source "$SCRIPT_DIR/lib/cachyos-preserve.sh"
+PRESERVE_CACHYOS=false
+RECOVERY_DIR=""
 
 usage() {
     cat <<USAGE
@@ -98,6 +102,9 @@ Usage: $(basename "$0") [--dry-run] [--yes] [--skip-user-configs] [--autologin]
                        system and exit. Nothing is installed or changed. Use
                        it after 'omarchy update' to confirm the reconciliation
                        still holds.
+  --preserve-cachyos   Require a root snapshot and boot/desktop backups; keep
+                       CachyOS NVIDIA setup and Snapper, block foreign kernels,
+                       suppress EFI deployment and defer the login switch.
 USAGE
 }
 
@@ -108,6 +115,7 @@ for arg in "$@"; do
         --skip-user-configs) SKIP_USER_CONFIGS=true ;;
         --autologin) AUTOLOGIN=true ;;
         --verify-only) VERIFY_ONLY=true ;;
+        --preserve-cachyos) PRESERVE_CACHYOS=true ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $arg" >&2; usage >&2; exit 1 ;;
     esac
@@ -497,6 +505,9 @@ if hooks_reason="$(hooks_conflict "$CURRENT_HOOKS" "$CMDLINE_CRYPT" "$LUKS_DETEC
 fi
 
 MERGED_HOOKS="$(merge_preview "$CURRENT_HOOKS" "$OMARCHY_REFERENCE_HOOKS")" || MERGED_HOOKS=""
+if $PRESERVE_CACHYOS && ! has_word kms "$CURRENT_HOOKS"; then
+    MERGED_HOOKS="$(printf '%s\n' "$MERGED_HOOKS" | sed -E 's/(^| )kms( |$)/ /g; s/^ +| +$//g')"
+fi
 
 # GPU vendor: read-only lspci probe via this repo's own detector. Under a
 # sysroot the fixture host has no GPU and probe output must not leak in from
@@ -651,7 +662,7 @@ decide skel_hypr_files "$SKEL_HYPR_FILES"
 decide boot_hook_policy "$([[ $BOOTLOADER == limine ]] && echo limine-native || echo hookdir-override)"
 decide skip_user_configs "$SKIP_USER_CONFIGS"
 decide skel_replay "$($SKIP_USER_CONFIGS && echo skipped || echo yes)"
-decide refresh_limine "$(if $SKIP_USER_CONFIGS; then echo skipped-user-configs; elif [[ $BOOTLOADER == limine ]]; then echo yes-restore-cachyos-conf; else echo skipped-not-limine; fi)"
+decide refresh_limine "$(if $SKIP_USER_CONFIGS; then echo skipped-user-configs; elif $PRESERVE_CACHYOS; then echo skipped-preserve-cachyos; elif [[ $BOOTLOADER == limine ]]; then echo yes-restore-cachyos-conf; else echo skipped-not-limine; fi)"
 decide provision_user "$($SKIP_USER_CONFIGS && echo skipped || echo yes)"
 decide autologin "$AUTOLOGIN"
 
@@ -821,6 +832,14 @@ check_update_guard() {
 check_cli() {
     command -v omarchy &>/dev/null
 }
+check_preservation_policy() {
+    grep -qxF "HookDir = $OMACACHY_HOOK_DIR/" /etc/pacman.conf || return 1
+    [[ -f /etc/pacman.d/hooks/00-omacachy-protect-stack.hook ]] || return 1
+    [[ -f /etc/pacman.d/hooks/00-omacachy-protect-kernel-removal.hook ]] || return 1
+    [[ -x /usr/local/lib/omacachy/package-guard ]] || return 1
+    [[ -f $OMACACHY_HOOK_DIR/80-limine-efi-deploy.hook ]] || return 1
+    ! pacman -Qq linux-omarchy &>/dev/null
+}
 check_iso_closure() {
     # The nine (plus avahi) packages apply-system needs but omarchy does not
     # depend on. A missing one here means the next `omarchy update` -- or the
@@ -895,7 +914,12 @@ run_assertion_suite() {
     assert "non-limine machine has no Limine config or UKI on /boot (the /usr/local/bin/mkinitcpio shim did not run limine-mkinitcpio)" check_no_limine_artifacts
     assert "non-limine machine has limine-snapper-sync.service disabled" check_limine_service
     assert "$LIMINE_DEFAULT carries the ENABLE_UKI/BOOT_ORDER/TARGET_OS_NAME overrides on a Limine host" check_limine_default
-    assert "sddm enabled; NetworkManager enabled" check_services
+    if $PRESERVE_CACHYOS; then
+        echo "Login switch deferred: select SDDM manually after reviewing the completed installation."
+        assert "CachyOS package guards and EFI hook override are present; linux-omarchy absent" check_preservation_policy
+    else
+        assert "sddm enabled; NetworkManager enabled" check_services
+    fi
     assert "/etc/sddm.conf absent (sddm.conf.d drop-ins take effect)" check_sddm_conf
     assert "/etc/snapper/configs/root matches the pre-install backup" check_snapper
     assert "the omarchy update guard hook is installed (direct 'pacman -Syu' will abort from here on)" check_update_guard
@@ -937,6 +961,39 @@ echo ""
 
 confirm "Proceed?" || { echo "Aborting."; exit 1; }
 
+if $PRESERVE_CACHYOS; then
+    $IS_CACHYOS || { echo 'Error: --preserve-cachyos requires CachyOS.' >&2; exit 1; }
+    [[ $BOOTLOADER == limine ]] || { echo 'Error: preservation mode currently requires Limine.' >&2; exit 1; }
+    if ! $DRY_RUN; then
+        [[ -f $SNAPPER_CONFIG ]] || { echo 'Error: a configured root Snapper is required.' >&2; exit 1; }
+        [[ $(pacman -Q omarchy-settings 2>/dev/null | awk '{print $2}' || true) != *dev* ]] || exit 1
+    fi
+    step "Recovery copies (boot and desktop)"
+    RECOVERY_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omacachy/recovery/$TIMESTAMP"
+    if $DRY_RUN; then
+        echo "DRYRUN: back up /boot, desktop configuration and public boot settings to $RECOVERY_DIR"
+    else
+        # Root and /boot are not in HOME's subvolume; these survive restoring /.
+        # No credential stores or general /etc archive are captured.
+        (umask 077; mkdir -p "$RECOVERY_DIR")
+        run_root tar -C /boot -cpf "$RECOVERY_DIR/boot.tar" .
+        run_root chmod 600 "$RECOVERY_DIR/boot.tar"
+        run_root sh -c 'find /boot -type f -iname "*.efi" -print0 | sort -z | xargs -0 -r sha256sum' >"$RECOVERY_DIR/efi-before.sha256"
+        desktop_paths=()
+        for desktop_path in .config/hypr .config/noctalia .config/uwsm; do
+            [[ ! -e $HOME/$desktop_path ]] || desktop_paths+=("$desktop_path")
+        done
+        if ((${#desktop_paths[@]})); then
+            (umask 077; tar -C "$HOME" -cpf "$RECOVERY_DIR/desktop.tar" "${desktop_paths[@]}")
+        fi
+        pacman -Q >"$RECOVERY_DIR/packages.txt"
+        for unit in greetd sddm; do
+            systemctl is-enabled "$unit" >"$RECOVERY_DIR/$unit.enabled" 2>/dev/null || true
+        done
+        echo "Recovery copies: $RECOVERY_DIR (same disk; copy to external storage for disk failure protection)."
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # Repo + keyring
 # ---------------------------------------------------------------------------
@@ -958,7 +1015,18 @@ confirm "Proceed?" || { echo "Aborting."; exit 1; }
 # ---------------------------------------------------------------------------
 
 step "Rollback point (snapper)"
-if $REAPPLY; then
+if $PRESERVE_CACHYOS; then
+    if $DRY_RUN; then
+        echo 'DRYRUN: create mandatory root snapshot without automatic cleanup'
+    else
+        snapshot_number="$(create_install_snapshot)" || {
+            echo 'Error: no verified rollback snapshot; refusing installation.' >&2
+            exit 1
+        }
+        printf '%s\n' "$snapshot_number" >"$RECOVERY_DIR/snapshot-id"
+        echo "Mandatory root snapshot: $snapshot_number (no automatic cleanup)."
+    fi
+elif $REAPPLY; then
     echo "Re-apply: no pre-install snapshot (the first run took one)."
     decide snapper_snapshot "skipped-reapply"
 elif [[ -f $(host_path "$SNAPPER_CONFIG") ]]; then
@@ -1208,6 +1276,42 @@ apply_boot_hook_policy() {
 
 step "Boot-hook policy"
 apply_boot_hook_policy
+if $PRESERVE_CACHYOS; then
+    # Keep Limine's kernel/initramfs hooks, but never deploy its EFI binary
+    # from this install or a later pacman transaction while this policy exists.
+    run_root mkdir -p "$OMACACHY_HOOK_DIR"
+    ensure_hookdir_lines
+    write_inert_hook 80-limine-efi-deploy.hook
+    run_root mkdir -p /usr/local/lib/omacachy /etc/pacman.d/hooks
+    render_cachyos_package_guard | write_root_file /usr/local/lib/omacachy/package-guard
+    run_root chmod 755 /usr/local/lib/omacachy/package-guard
+    write_root_file /etc/pacman.d/hooks/00-omacachy-protect-stack.hook <<'EOF'
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = *
+
+[Action]
+Description = Protecting CachyOS kernel and NVIDIA modules...
+When = PreTransaction
+Exec = /bin/bash /usr/local/lib/omacachy/package-guard
+NeedsTargets
+AbortOnFail
+EOF
+    write_root_file /etc/pacman.d/hooks/00-omacachy-protect-kernel-removal.hook <<'EOF'
+[Trigger]
+Operation = Remove
+Type = Package
+Target = linux-cachyos*
+
+[Action]
+Description = Refusing removal of the preserved CachyOS kernel stack...
+When = PreTransaction
+Exec = /usr/bin/false
+AbortOnFail
+EOF
+fi
 
 # ---------------------------------------------------------------------------
 # Pre-install reconciliation
@@ -1312,7 +1416,14 @@ fi
 # bin/lib/hooks-merge.sh.
 if [[ -n $CURRENT_HOOKS ]]; then
     run_root mkdir -p /etc/mkinitcpio.conf.d
-    render_keep_hooks_conf "$CURRENT_HOOKS" | write_root_file "$ZZ_HOOKS_CONF"
+    {
+        render_keep_hooks_conf "$CURRENT_HOOKS"
+        if $PRESERVE_CACHYOS && ! has_word kms "$CURRENT_HOOKS"; then
+            # chwd deliberately excluded kms on this NVIDIA host. Omarchy's
+            # later HOOKS assignment would otherwise reintroduce nouveau.
+            printf '\n# Preserve the captured CachyOS decision to omit kms.\nHOOKS=(${HOOKS[@]/kms/})\n'
+        fi
+    } | write_root_file "$ZZ_HOOKS_CONF"
     echo "Predicted merged HOOKS against omarchy-settings $OMARCHY_RECONCILED_VERSION's array: ($MERGED_HOOKS)"
 else
     echo "Warning: could not determine current mkinitcpio HOOKS; skipping $ZZ_HOOKS_CONF." >&2
@@ -1451,6 +1562,7 @@ fi
 # land so they actually take effect (PR #28 / plan 006 rationale).
 if [[ -f $(host_path /etc/sddm.conf) ]]; then
     echo "Removing stale /etc/sddm.conf so package-shipped sddm.conf.d drop-ins win."
+    run_root cp -a /etc/sddm.conf "/etc/sddm.conf.$BACKUP_SUFFIX"
     run_root rm -f /etc/sddm.conf
 fi
 
@@ -1479,12 +1591,54 @@ fi
 # ---------------------------------------------------------------------------
 
 step "Installing omarchy packages"
+# CachyOS desktop presets and Omarchy both own skel defaults. Retire only the
+# preset packages, never their runtime dependencies and never with --overwrite.
+# Noctalia's greeter uses two preset-owned files outside skel; retain those
+# (and the NVIDIA profile environment) so the existing greeter remains usable.
+if $PRESERVE_CACHYOS; then
+    CACHYOS_PRESETS=()
+    for preset_package in cachyos-hypr-noctalia cachyos-alacritty-config; do
+        pkg_installed "$preset_package" && CACHYOS_PRESETS+=("$preset_package")
+    done
+    if ((${#CACHYOS_PRESETS[@]})); then
+        step "Retiring conflicting desktop preset packages"
+        run_root tar -C / -cpf "$RECOVERY_DIR/cachyos-skel.tar" etc/skel
+        run_root chmod 600 "$RECOVERY_DIR/cachyos-skel.tar"
+        run_root mkdir -p "$RECOVERY_DIR/greeter-files"
+        run_root bash -c '
+            set -euo pipefail
+            backup=$1
+            shift
+            for path in "$@"; do
+                [[ ! -e $path ]] || cp -a --parents "$path" "$backup/"
+            done
+        ' bash "$RECOVERY_DIR/greeter-files" /etc/profile.d/Hyprland.sh \
+            /usr/share/noctalia-greeter/config.toml /var/lib/noctalia-greeter/greeter.toml
+        PRESET_REMOVE_RC=0
+        run_root env OMARCHY_ALLOW_DIRECT_PACMAN=1 pacman -R --noconfirm "${CACHYOS_PRESETS[@]}" || PRESET_REMOVE_RC=$?
+        run_root cp -a "$RECOVERY_DIR/greeter-files/." /
+        if (( PRESET_REMOVE_RC != 0 )); then
+            echo 'Error: preset removal was refused; dependencies were not forced. Review before retrying.' >&2
+            exit "$PRESET_REMOVE_RC"
+        fi
+        echo 'Removed desktop preset packages only; Noctalia, greetd, Hyprland and their runtime dependencies are retained.'
+        step "Installing omarchy packages"
+    fi
+fi
+# The preservation PreTransaction guard checks the resolved repository version
+# after -Syu refreshes databases, including on hosts with no omarchy.db yet.
 # On a re-apply the omarchy package's 00-omarchy-update-guard.hook is already
 # installed (PreTransaction, AbortOnFail); omarchy-update-pacman-guard:8 lets a
 # direct -Syu through only with OMARCHY_ALLOW_DIRECT_PACMAN=1.
 echo "Also installing the ISO package closure: ${OMARCHY_ISO_CLOSURE[*]}"
 run_root env OMARCHY_ALLOW_DIRECT_PACMAN=1 pacman -Syu --needed --noconfirm \
     omarchy-settings omarchy omarchy-nvim "${OMARCHY_ISO_CLOSURE[@]}"
+if $PRESERVE_CACHYOS && ! $DRY_RUN; then
+    [[ $(pkg_version omarchy) == 4.0.6-1 && $(pkg_version omarchy-settings) == 4.0.6-1 ]] || {
+        echo 'Error: preservation staging was reviewed for 4.0.6-1 only; stopping before apply.' >&2
+        exit 1
+    }
+fi
 decide iso_closure "${OMARCHY_ISO_CLOSURE[*]}"
 
 # The startup drift check runs before the packages exist on a fresh host, so it
@@ -1668,7 +1822,19 @@ step "Running omarchy-apply-system"
 if [[ -f $APPLY_LOG ]]; then
     APPLY_LOG_SEEN="$(wc -l <"$APPLY_LOG")"
 fi
-run_root omarchy-apply-system --install-user "$USER" --first-install
+APPLY_RC=0
+if $PRESERVE_CACHYOS; then
+    if $DRY_RUN; then
+        echo 'DRYRUN: stage root-owned Omarchy install tree; skip NVIDIA, Snapper and pacman reset; defer SDDM'
+    else
+        STAGED_INSTALL="$(run_root mktemp -d /var/tmp/omacachy-install.XXXXXXXX)"
+        run_root bash -c 'source "$1"; stage_cachyos_install_tree "$2" "$3"' bash \
+            "$SCRIPT_DIR/lib/cachyos-preserve.sh" /usr/share/omarchy/install "$STAGED_INSTALL"
+        run_root env OMARCHY_INSTALL="$STAGED_INSTALL" omarchy-apply-system --install-user "$USER" --first-install || APPLY_RC=$?
+    fi
+else
+    run_root omarchy-apply-system --install-user "$USER" --first-install || APPLY_RC=$?
+fi
 
 # ---------------------------------------------------------------------------
 # Post-apply pacman reconciliation
@@ -1700,7 +1866,13 @@ else
         ensure_hookdir_lines
     fi
 fi
-run_root pacman -Sy --noconfirm
+if (( APPLY_RC != 0 )); then
+    echo "Error: apply-system failed ($APPLY_RC); pacman configuration restored. Do not reboot until recovery is reviewed." >&2
+    diagnose_apply_log
+    exit "$APPLY_RC"
+fi
+# The initial -Syu synchronized these databases. A second -Sy followed by -S
+# would create a partial-upgrade window.
 
 # ---------------------------------------------------------------------------
 # Post-apply /etc reconciliation
@@ -1836,22 +2008,14 @@ seed_user_configs() {
     fi
 
     if [[ -d $(host_path /etc/skel) ]]; then
-        local home_backup_dir="$HOME/.omarchy-quattro-backup-$TIMESTAMP" entry name
+        local home_backup_dir="$HOME/.omarchy-quattro-backup-$TIMESTAMP"
         if $SKEL_HYPR_FILES; then
             echo "Note: /etc/skel contains a .config/hypr tree (CachyOS's Hyprland profile ships one, and so does Omarchy). It is about to be copied over \$HOME."
         fi
         if $DRY_RUN; then
             echo "DRYRUN: back up \$HOME entries shadowed by /etc/skel to $home_backup_dir before omarchy-reinstall-configs"
         else
-            mkdir -p "$home_backup_dir"
-            shopt -s dotglob nullglob
-            for entry in /etc/skel/*; do
-                name="$(basename "$entry")"
-                if [[ -e "$HOME/$name" ]]; then
-                    cp -a "$HOME/$name" "$home_backup_dir/$name"
-                fi
-            done
-            shopt -u dotglob nullglob
+            backup_skel_collisions /etc/skel "$HOME" "$home_backup_dir"
             echo "Backed up pre-existing \$HOME entries shadowed by /etc/skel to $home_backup_dir"
         fi
     else
@@ -1859,7 +2023,7 @@ seed_user_configs() {
     fi
 
     if command -v omarchy-reinstall-configs &>/dev/null; then
-        if [[ $BOOTLOADER == "limine" ]]; then
+        if [[ $BOOTLOADER == "limine" ]] && ! $PRESERVE_CACHYOS; then
             run omarchy-reinstall-configs
             # refresh-limine replaced the CachyOS loader config with
             # Omarchy's branded one. Put the pre-install file back and
@@ -1869,7 +2033,7 @@ seed_user_configs() {
                 run_root limine-update
             fi
         else
-            echo "Shadowing omarchy-refresh-limine for this call: the bootloader is $BOOTLOADER, not Limine."
+            echo "Shadowing omarchy-refresh-limine for this call (bootloader: $BOOTLOADER, preserve CachyOS: $PRESERVE_CACHYOS)."
             local shim_dir
             if $DRY_RUN; then
                 echo "DRYRUN: omarchy-reinstall-configs (with a no-op omarchy-refresh-limine first on PATH)"
@@ -1940,7 +2104,11 @@ case "$GPU_TYPE" in
     amd)    echo "Detected AMD GPU -> dispatch target: bin/amd-rocm.sh (via gpu-setup.sh)" ;;
     none)   echo "No GPU detected -> gpu-setup.sh will no-op" ;;
 esac
-run env OMACACHY_SKIP_USER_CONFIGS="$($SKIP_USER_CONFIGS && echo 1 || echo 0)" bash "$SCRIPT_DIR/gpu-setup.sh"
+if $PRESERVE_CACHYOS; then
+    echo 'Keeping the CachyOS GPU setup; vendor setup scripts are skipped.'
+else
+    run env OMACACHY_SKIP_USER_CONFIGS="$($SKIP_USER_CONFIGS && echo 1 || echo 0)" bash "$SCRIPT_DIR/gpu-setup.sh"
+fi
 
 # ---------------------------------------------------------------------------
 # Remaining post-apply reconciliation
@@ -2001,7 +2169,7 @@ if [[ $BOOTLOADER != "limine" ]]; then
     else
         decide limine_artifacts "none"
     fi
-else
+elif ! $PRESERVE_CACHYOS; then
     # Secure Boot on a Limine host: the user-config seeding above ends in
     # omarchy-refresh-limine → limine-update → limine-install, whose
     # fallback-loader update copies the UNSIGNED packaged
@@ -2032,10 +2200,55 @@ step "Rebuilding initramfs"
 # shellcheck disable=SC2086
 run_root $INITRAMFS_REBUILD
 
+if $PRESERVE_CACHYOS && ! $DRY_RUN; then
+    # limine-mkinitcpio may return zero after skipping a failed image build.
+    # Check the real artifacts and module availability for every CachyOS
+    # kernel, instead of treating its exit code as proof of success.
+    CHECKED_KERNELS=0
+    for kernel_file in /usr/lib/modules/*/pkgbase; do
+        [[ -r $kernel_file ]] || continue
+        read -r kernel_package <"$kernel_file"
+        [[ $kernel_package == linux-cachyos* ]] || continue
+        CHECKED_KERNELS=$((CHECKED_KERNELS + 1))
+        kernel_version="${kernel_file%/pkgbase}"
+        kernel_version="${kernel_version##*/}"
+        run_root test -s "/boot/vmlinuz-$kernel_package" || exit 1
+        run_root lsinitcpio -l "/boot/initramfs-$kernel_package.img" |
+            grep -F "usr/lib/modules/$kernel_version/" >/dev/null || {
+                echo "Error: initramfs does not contain modules for $kernel_version; do not reboot." >&2
+                exit 1
+            }
+        if [[ $GPU_TYPE == nvidia ]]; then
+            modinfo -k "$kernel_version" nvidia >/dev/null || {
+                echo "Error: NVIDIA module missing for $kernel_version; do not reboot." >&2
+                exit 1
+            }
+        fi
+        if $LUKS_DETECTED; then
+            run_root lsinitcpio -l "/boot/initramfs-$kernel_package.img" |
+                grep 'usr/lib/systemd/systemd-cryptsetup' >/dev/null || {
+                    echo "Error: cannot verify cryptsetup in $kernel_package initramfs; do not reboot." >&2
+                    exit 1
+                }
+        fi
+    done
+    (( CHECKED_KERNELS > 0 )) || { echo 'Error: no CachyOS kernel artifacts verified.' >&2; exit 1; }
+    run_root sh -c 'find /boot -type f -iname "*.efi" -print0 | sort -z | xargs -0 -r sha256sum' >"$RECOVERY_DIR/efi-after.sha256"
+    cmp -s "$RECOVERY_DIR/efi-before.sha256" "$RECOVERY_DIR/efi-after.sha256" || {
+        echo 'Error: EFI file inventory changed unexpectedly; review recovery copies before rebooting.' >&2
+        exit 1
+    }
+fi
+
 run_assertion_suite || exit 1
 
 echo ""
 echo "Done."
+if $PRESERVE_CACHYOS; then
+    echo "CachyOS preservation mode: recovery copies are in $RECOVERY_DIR."
+    echo 'The existing login manager was not switched; validate the install before selecting SDDM.'
+    echo 'Foreign kernel/NVIDIA package transactions are blocked. Future Omarchy migrations may stop for manual review.'
+fi
 echo ""
 echo "Note: the omarchy package installs /usr/share/libalpm/hooks/00-omarchy-update-guard.hook,"
 echo "a PreTransaction AbortOnFail hook. From now on every direct 'pacman -Syu' on this"

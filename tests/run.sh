@@ -1156,6 +1156,98 @@ run_probe() {
     expect_contains "probe: the second run finishes the stage too" "configs: OK" "$out"
 }
 
+run_preserve() {
+    head_ 'CachyOS preservation'
+    # shellcheck source=bin/lib/cachyos-preserve.sh
+    source "$REPO_DIR/bin/lib/cachyos-preserve.sh"
+    local d="$WORK/preserve" rc package
+    mkdir -p "$d/source"/{hardware,config,post-install} "$d/staged"
+    printf 'do-not-run-nvidia\n' >"$d/source/hardware/nvidia.sh"
+    printf 'do-not-run-snapper\n' >"$d/source/config/snapper.sh"
+    printf 'do-not-reset-pacman\n' >"$d/source/post-install/pacman.sh"
+    printf 'systemctl enable sddm.service\nsystemctl enable NetworkManager.service\n' >"$d/source/config/enable-services.sh"
+    stage_cachyos_install_tree "$d/source" "$d/staged"
+    expect_eq 'preserve: package original untouched' 'do-not-run-nvidia' "$(cat "$d/source/hardware/nvidia.sh")"
+    expect_contains 'preserve: staged NVIDIA is a visible skip' 'preserving CachyOS' "$(bash "$d/staged/hardware/nvidia.sh")"
+    expect_eq 'preserve: staged login switch removed' '' "$(grep 'sddm' "$d/staged/config/enable-services.sh")"
+    expect_contains 'preserve: other services retained' 'NetworkManager.service' "$(cat "$d/staged/config/enable-services.sh")"
+    printf 'changed-layout\n' >"$d/source/config/enable-services.sh"
+    if stage_cachyos_install_tree "$d/source" "$d/staged"; then
+        bad 'preserve: reject service stage drift'
+    else
+        ok 'preserve: reject service stage drift'
+    fi
+    render_cachyos_package_guard >"$d/guard"
+    for package in linux-omarchy linux-omarchy-headers nvidia-open-dkms nvidia-580xx-utils linux; do
+        rc=0
+        printf '%s\n' "$package" | bash "$d/guard" >/dev/null 2>&1 || rc=$?
+        expect_eq "preserve: blocks $package" 1 "$rc"
+    done
+    rc=0
+    printf '%s\n' linux-cachyos linux-cachyos-lts linux-cachyos-nvidia-open nvidia-utils hyprland | bash "$d/guard" || rc=$?
+    expect_eq 'preserve: allows CachyOS stack upgrades' 0 "$rc"
+    mkdir -p "$d/bin"
+    printf '#!/bin/sh\nprintf "Version : %%s\\n" "$TEST_REPO_VERSION"\n' >"$d/bin/pacman"
+    chmod +x "$d/bin/pacman"
+    rc=0
+    printf 'omarchy\n' | TEST_REPO_VERSION=4.0.6-1 PATH="$d/bin:$PATH" bash "$d/guard" || rc=$?
+    expect_eq 'preserve: reviewed Omarchy candidate allowed' 0 "$rc"
+    rc=0
+    printf 'omarchy-settings\n' | TEST_REPO_VERSION=4.0.7-1 PATH="$d/bin:$PATH" bash "$d/guard" >/dev/null 2>&1 || rc=$?
+    expect_eq 'preserve: unreviewed Omarchy upgrade blocked' 1 "$rc"
+    # Exercise Snapper failures with success-shaped stdout: a pipe to tail
+    # or ignoring the status would falsely accept these as rollback points.
+    rc=0
+    (run_root() { echo 42; return 1; }; create_install_snapshot) >"$d/snapshot" 2>/dev/null || rc=$?
+    expect_eq 'preserve: snapshot command failure is fatal' 1 "$rc"
+    rc=0
+    (run_root() { echo 'warning: no snapshot'; }; create_install_snapshot) >"$d/snapshot" 2>/dev/null || rc=$?
+    expect_eq 'preserve: nonnumeric snapshot is rejected' 1 "$rc"
+    expect_eq 'preserve: valid snapshot ID retained' 42 "$(run_root() { echo 42; }; create_install_snapshot)"
+    dry_run_fixture cachyos-limine-luks "$d/out" "$d/dec" --preserve-cachyos
+    expect_contains 'preserve: EFI deploy suppressed' '80-limine-efi-deploy.hook' "$(cat "$d/out")"
+    expect_contains 'preserve: apply is staged' 'stage root-owned Omarchy install tree' "$(cat "$d/out")"
+    expect_eq 'preserve: Limine refresh explicitly skipped' 'skipped-preserve-cachyos' "$(decision "$d/dec" refresh_limine)"
+    expect_eq 'preserve: vendor GPU setup not called' '' "$(grep 'DRYRUN:.*gpu-setup.sh' "$d/out")"
+    cp -a "$FIXTURES/cachyos-limine-luks" "$d/preset-host"
+    mkdir -p "$d/preset-host/var/lib/pacman/local/cachyos-hypr-noctalia-1.2.6-1" \
+        "$d/preset-host/var/lib/pacman/local/cachyos-alacritty-config-1.1-1"
+    touch "$d/preset-host/var/lib/pacman/local/cachyos-hypr-noctalia-1.2.6-1/desc" \
+        "$d/preset-host/var/lib/pacman/local/cachyos-alacritty-config-1.1-1/desc"
+    rc=0
+    PATH="$(omarchy_stubs):$PATH" OMACACHY_SYSROOT="$d/preset-host" \
+        OMACACHY_LOG="$d/preset.log" bash "$INSTALLER" --dry-run --yes --preserve-cachyos >"$d/preset.out" 2>&1 || rc=$?
+    expect_eq 'preserve: host with conflicting presets plans successfully' 0 "$rc"
+    expect_contains 'preserve: only preset packages removed without recursion' \
+        'pacman -R --noconfirm cachyos-hypr-noctalia cachyos-alacritty-config' "$(cat "$d/preset.out")"
+    expect_contains 'preserve: preset skel backed up' 'cachyos-skel.tar' "$(cat "$d/preset.out")"
+    expect_contains 'preserve: greeter config retained' '/usr/share/noctalia-greeter/config.toml' "$(cat "$d/preset.out")"
+    local skel="$d/skel" user_home="$d/user-home" backup="$d/seed-backup"
+    mkdir -p "$skel/.config/hypr" "$skel/.local/state/omarchy" \
+        "$user_home/.config/hypr" "$user_home/.local/state/omarchy" \
+        "$user_home/.local/state/omacachy/recovery"
+    printf 'shipped\n' >"$skel/.config/hypr/hyprland.lua"
+    printf 'marker\n' >"$skel/.local/state/omarchy/marker"
+    printf 'shipped\n' >"$skel/.config/broken"
+    printf 'original\n' >"$user_home/.config/hypr/hyprland.lua"
+    printf 'old-marker\n' >"$user_home/.local/state/omarchy/marker"
+    touch "$user_home/.local/state/omacachy/recovery/boot.tar"
+    chmod 000 "$user_home/.local/state/omacachy/recovery/boot.tar"
+    ln -s missing-target "$user_home/.config/broken"
+    rc=0
+    backup_skel_collisions "$skel" "$user_home" "$backup" || rc=$?
+    expect_eq 'seeding backup: root-only recovery archive does not abort backup' 0 "$rc"
+    expect_eq 'seeding backup: existing Hyprland config is retained' original "$(cat "$backup/.config/hypr/hyprland.lua")"
+    expect_eq 'seeding backup: overlapping state file is retained' old-marker "$(cat "$backup/.local/state/omarchy/marker")"
+    expect_eq 'seeding backup: dangling symlink is retained' missing-target "$(readlink "$backup/.config/broken")"
+    if [[ ! -e $backup/.local/state/omacachy ]]; then
+        ok 'seeding backup: unrelated recovery tree is not copied'
+    else
+        bad 'seeding backup: unrelated recovery tree is not copied'
+    fi
+    expect_eq 'seeding backup: archive permissions remain unchanged' 0 "$(stat -c %a "$user_home/.local/state/omacachy/recovery/boot.tar")"
+}
+
 case "${1:-all}" in
     lint)     run_lint ;;
     hooks)    run_hooks ;;
@@ -1168,8 +1260,9 @@ case "${1:-all}" in
     probe)    run_probe ;;
     matrix)   run_matrix ;;
     purity)   run_purity ;;
-    all)      run_lint; run_hooks; run_units; run_picker; run_gpu; run_guard; run_rollback; run_packages; run_probe; run_matrix; run_purity ;;
-    *)        echo "Usage: $0 [lint|hooks|units|picker|gpu|guard|rollback|packages|probe|matrix|purity|all]" >&2; exit 2 ;;
+    preserve) run_preserve ;;
+    all)      run_lint; run_hooks; run_units; run_picker; run_gpu; run_guard; run_rollback; run_packages; run_probe; run_matrix; run_purity; run_preserve ;;
+    *)        echo "Usage: $0 [lint|hooks|units|picker|gpu|guard|rollback|packages|probe|matrix|purity|preserve|all]" >&2; exit 2 ;;
 esac
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

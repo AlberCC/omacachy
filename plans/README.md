@@ -88,6 +88,7 @@ lines in this header were corrected at the same time (see the branch note).
 | 048 | Settle the two unfilled switches in the agent docs | P3 | S | — | DONE (this commit; label table kept as a registry minus the template instruction, `gh pr` block gated behind the flag rather than cut) |
 | 049 | Bring `AGENTS.md` in line with the repo's document conventions | P3 | S | 047 (its outcome decides one line here) | DONE (this commit; H1 added, Domain docs line matches 047, pointer to `handoff.md`) |
 | 050 | A narrow integrity check for the plan record (`bin/check-docs.sh`: plan files vs index rows, cited commit hashes resolve, asserted paths exist) | P3 | S | 046 | DONE (this commit; 50 files / 50 rows, 110 hashes, 24 asserted paths; four injected defects each caught, incl. a replay of the original domain-doc defect) |
+| 051 | Opt-in CachyOS preservation mode for Omarchy 4.0.6-1 | P1 | M | 045 | IN PROGRESS (fixture checks and first hardware install/reboot confirmed; recovery and future upgrades remain unverified) |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) |
 REJECTED (with one-line rationale)

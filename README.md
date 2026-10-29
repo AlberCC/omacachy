@@ -1,5 +1,15 @@
 # omacachy
 
+This is AlberCC's fork of [t1nk333r/omacachy](https://github.com/t1nk333r/omacachy),
+building on the original work by Mark Roboff and subsequent contributors.
+This fork adds an opt-in CachyOS preservation mode and shared agent workflows;
+upstream attribution, license notices and commit history are retained.
+
+For the new opt-in CachyOS preservation mode targeting **4.0.6-1**, see
+[installation checkpoints and recovery](docs/install-cachyos-preserved.md).
+This mode has fixture validation and one successful hardware installation and
+reboot reported by its operator; recovery and future upgrades remain unverified.
+
 Install [DHH's Omarchy](https://omarchy.org) — an opinionated, Hyprland-based
 desktop — on top of [CachyOS](https://cachyos.org), a performance-optimized
 Arch Linux distribution, without either one clobbering the other.
@@ -76,7 +86,7 @@ reconciles everything in that process that would otherwise clobber CachyOS
 state.
 
 ```bash
-git clone https://github.com/t1nk333r/omacachy.git
+git clone https://github.com/AlberCC/omacachy.git
 cd omacachy
 bin/install-omarchy-quattro.sh --dry-run   # review the exact plan first
 bin/install-omarchy-quattro.sh             # then run it for real
@@ -720,3 +730,11 @@ We welcome contributions! Here's how:
 - Follow existing code style and conventions
 - Update documentation when adding features
 - Report bugs via GitHub Issues
+
+## Coding-agent assistance
+
+The repository includes shared Omacachy workflows for installation, maintenance,
+updates, diagnosis and recovery, with plugin manifests for Codex and Claude Code
+and instruction entry points for Copilot and Gemini CLI. See
+[agent package and compatibility](docs/agents/assistant-package.md).
+Machine profiles and logs stay private outside the repository.
